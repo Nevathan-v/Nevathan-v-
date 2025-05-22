@@ -1,0 +1,159 @@
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <math.h>
+#include "EmonLib.h"
+#include <PID_v1.h>
+#define SOURCE_SELECT_RELAY 2  // Relay to choose between Solar and Wind
+
+// CONFIG 
+#define AVG_WINDOW 10
+#define SinDivisions 400
+#define RELAY_PIN 3
+#define VOLTAGE_THRESHOLD 211.0
+#define CURRENT_SENSOR A6
+#define CURRENT_SAMPLES 1000
+#define DEFAULT_SENSITIVITY 0.052  // Nominal for ACS712-30A
+
+// STATE
+float voltageSamples[AVG_WINDOW];
+int sampleIndex = 0;
+EnergyMonitor emon1;
+static int microMHz = 16;
+static int freq = 50;
+static long int period;
+static unsigned int lookUp[SinDivisions];
+static char theTCCR1A = 0b10000010;
+
+// PID
+double Setpoint = 210.0;
+double Input, Output;
+double Kp = 0.02, Ki = 0.02, Kd = 0.0;
+PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, DIRECT);
+// DC Current
+float currentOffset = 2.5;       // Updated at runtime
+float currentSensitivity = DEFAULT_SENSITIVITY;
+
+// SETUP 
+void setup() {
+  Serial.begin(9600);
+  period = microMHz * 1e6 / freq / SinDivisions;
+  emon1.voltage(2, 234.26, 1.7);
+  myPID.SetMode(AUTOMATIC);
+  myPID.SetOutputLimits(0.5, 1.8);
+  updateLookupTable(1.0);
+  TCCR1A = theTCCR1A;
+  TCCR1B = 0b00011001;
+  TIMSK1 = 0b00000001;
+  ICR1 = period;
+  sei();
+  DDRB = 0b00000110; // OC1A/OC1B as output
+  pinMode(SOURCE_SELECT_RELAY, OUTPUT);
+  digitalWrite(SOURCE_SELECT_RELAY, LOW);  // Default OFF
+  pinMode(13, OUTPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(CURRENT_SENSOR, INPUT);
+  digitalWrite(RELAY_PIN, LOW);
+  // Calibrate zero offset at 0A
+  currentOffset = getSensorOffset(CURRENT_SENSOR);
+}
+
+// LOOP 
+void loop() {
+  emon1.calcVI(20, 2000);
+  float rawVoltage = emon1.Vrms;
+  Input = getSmoothedVoltage(rawVoltage);
+  myPID.Compute();
+  updateLookupTable(Output);
+  int adc1 = analogRead(A7);
+  int adc2 = analogRead(A0);
+  int adc3 = analogRead(A1);
+  const float scaleFactor = (5.0 / 1023.0) * 5.0 * 0.9359;  // Calibrated 5:1
+  float voltage1 = adc1 * scaleFactor;
+  float voltage2 = adc2 * scaleFactor;
+  float voltage3 = adc3 * scaleFactor;
+ 
+ // Print voltage
+   // Relay logic
+  digitalWrite(RELAY_PIN, (Input < VOLTAGE_THRESHOLD) ? LOW : HIGH);
+  // DC current read
+  float current = readDcCurrent();
+  if (voltage2 > 0.1 || voltage3 > 0.1) {
+  // Only enter if at least one voltage source is active
+  if (voltage2 > voltage3) {
+    digitalWrite(SOURCE_SELECT_RELAY, HIGH);  // Solar selected
+  } else {
+    digitalWrite(SOURCE_SELECT_RELAY, LOW);   // Wind selected
+  }
+}
+  // Serial output
+  Serial.print("Battery Voltage 1: ");
+  Serial.print(voltage1, 2);
+  Serial.print(" V |  Solar Voltage: ");
+  Serial.print(voltage2, 2);
+  Serial.print(" V | Wind Volatge: ");
+  Serial.print(voltage3, 2);
+  Serial.println(" V");
+  Serial.print("AC Voltage: ");
+  Serial.print(Input);
+  Serial.print(" | Scale: ");
+  Serial.print(Output, 3);
+  Serial.print(" | DC Current: ");
+  Serial.print(current, 3);
+  Serial.println(" A");
+  delay(300);
+}
+
+// FUNCTIONS 
+float getSmoothedVoltage(float newSample) {
+  voltageSamples[sampleIndex] = newSample;
+  sampleIndex = (sampleIndex + 1) % AVG_WINDOW;
+  float sum = 0;
+  for (int i = 0; i < AVG_WINDOW; i++) {
+    sum += voltageSamples[i];
+  }
+  return sum / AVG_WINDOW;
+}
+void updateLookupTable(double scale) {
+  for (int i = 0; i < SinDivisions / 2; i++) {
+    double temp = sin(i * 2 * M_PI / SinDivisions) * period;
+    lookUp[i] = (int)(temp * scale + 0.5);
+  }
+}
+float getSensorOffset(int pin) {
+  long sum = 0;
+  for (int i = 0; i < 1000; i++) {
+    sum += analogRead(pin);
+    delayMicroseconds(100);
+  }
+  return (sum / 1000.0) * 5.0 / 1023.0;
+}
+float readDcCurrent() {
+  float total = 0;
+  for (int i = 0; i < CURRENT_SAMPLES; i++) {
+    int adc = analogRead(CURRENT_SENSOR);
+    float voltage = adc * 5.0 / 1023.0;
+    float current = (voltage - currentOffset) / currentSensitivity;
+    total += current;
+    delayMicroseconds(100);
+  }
+  return total / CURRENT_SAMPLES;
+}
+
+// TIMER ISR 
+ISR(TIMER1_OVF_vect) {
+  static int num;
+  static int delay1;
+  static char trig;
+  if (delay1 == 1) {
+    theTCCR1A ^= 0b10100000;
+    TCCR1A = theTCCR1A;
+    delay1 = 0;
+  } else if (num >= SinDivisions / 2) {
+    num = 0;
+    delay1++;
+    trig ^= 0b00000001;
+    digitalWrite(13, trig);
+  }
+  OCR1A = OCR1B = lookUp[num];
+  num++;
+}
